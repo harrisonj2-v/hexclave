@@ -171,6 +171,71 @@ export async function linkOAuthAccountToUser(
 }
 
 /**
+ * Create a project user OAuth account with the provided data.
+ * Used for the "link" flow which doesn't go through the standard sign-up path.
+ */
+export async function createProjectUserOAuthAccountForLink(prisma: PrismaClientTransaction, params: {
+  tenancyId: string,
+  providerId: string,
+  providerAccountId: string,
+  email: string | null,
+  projectUserId: string,
+}) {
+  return await prisma.projectUserOAuthAccount.create({
+    data: {
+      configOAuthProviderId: params.providerId,
+      providerAccountId: params.providerAccountId,
+      email: params.email,
+      projectUser: {
+        connect: {
+          tenancyId_projectUserId: {
+            tenancyId: params.tenancyId,
+            projectUserId: params.projectUserId,
+          },
+        },
+      },
+    },
+  });
+}
+
+/**
+ * Persist the provider's access token (and refresh token, if any) for an OAuth account, so they can later be
+ * served through the connected-accounts API.
+ */
+export async function storeOAuthProviderTokens(prisma: PrismaClientTransaction, params: {
+  tenancyId: string,
+  oauthAccountId: string,
+  providerTokens: {
+    accessToken: string,
+    refreshToken: string | null,
+    accessTokenExpiresAtMillis: number | null,
+    scopes: string[],
+  },
+}): Promise<void> {
+  const { tenancyId, oauthAccountId, providerTokens } = params;
+  if (providerTokens.refreshToken != null) {
+    await prisma.oAuthToken.create({
+      data: {
+        tenancyId,
+        refreshToken: providerTokens.refreshToken,
+        scopes: providerTokens.scopes,
+        oauthAccountId,
+      },
+    });
+  }
+
+  await prisma.oAuthAccessToken.create({
+    data: {
+      tenancyId,
+      accessToken: providerTokens.accessToken,
+      scopes: providerTokens.scopes,
+      expiresAt: providerTokens.accessTokenExpiresAtMillis == null ? null : new Date(providerTokens.accessTokenExpiresAtMillis),
+      oauthAccountId,
+    },
+  });
+}
+
+/**
  * Create a new user and OAuth account.
  *
  * This is used when a new OAuth sign-up should create a new user account.
