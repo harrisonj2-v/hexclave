@@ -76,6 +76,12 @@ jobs:
           sed "s/^[[:space:]]*\"version\":.*/$version/" packages/template/package-template.json > packages/template/package-template.json.untracked.tmp
           mv packages/template/package-template.json.untracked.tmp packages/template/package-template.json
 
+          # `changeset version` just rewrote the workspace package.json versions, so pnpm's
+          # verifyDepsBeforeRun (pnpm-workspace.yaml) sees the workspace as changed since the last
+          # install and refuses the `pnpm run` below. Re-install to record the new state. The lockfile
+          # stores workspace deps as `link:` paths without versions, so --frozen-lockfile still passes.
+          pnpm install --frozen-lockfile
+
           # The AI setup prompt pins the SDK version it tells users to import from esm.sh, so bumping
           # package versions changes the docs generated from it. Regenerate them here, or the committed
           # files go stale and lint-and-build's "check for uncommitted changes" step fails on dev and on
