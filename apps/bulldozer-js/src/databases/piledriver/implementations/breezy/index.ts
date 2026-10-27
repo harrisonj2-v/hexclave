@@ -12,6 +12,36 @@ import { planHeapObjects } from "./heap-plan.js";
 
 const breezyPiledriverProcessStartedAtMillis = Date.now();
 const gcSchemaVersion = 3;
+/**
+ * How many garbage objects GC deletes per LMDB transaction.
+ *
+ * GC waits for each commit before starting the next, and a commit takes ~4 ms, so deleting one
+ * object per transaction capped GC at ~200 objects/s (base, which lets its writes share commits,
+ * did ~1,500/s). Each transaction holds LMDB's single write lock, so a bigger batch also delays
+ * normal writes that arrive during GC; 256 per transaction raised write p50 from ~18 to ~78 ms.
+ */
+const gcDeletionsPerTransaction = 64;
+/**
+ * How many child refcount updates one GC transaction may make before it stops taking more objects.
+ *
+ * The object limit alone doesn't bound the work: each deleted object decrements every child it
+ * references. Bulldozer's trees have at most 32 children per node, so a normal batch stays far below
+ * this, but a caller-made heap object can reference thousands of children. 64 objects with 5,000
+ * children each held the write lock for ~1.9 s in one transaction, stalling every write behind it.
+ */
+const gcReferenceUpdatesPerTransaction = 4096;
+
+/**
+ * Returns `items` sorted by their LMDB key, for writing in that order.
+ *
+ * LMDB keeps keys sorted in fixed-size pages. A key that belongs in the middle of a full page splits
+ * it into two half-empty pages, while keys arriving in ascending order just fill the last page. The
+ * planner reserves keys parents-first but saves children first, so unsorted writes left heap pages
+ * about half empty. Write order inside one transaction doesn't change what is committed.
+ */
+const ascendingByKey = <T>(items: T[], keyOf: (item: T) => Uint8Array) => {
+  return [...items].sort((a, b) => Buffer.compare(keyOf(a), keyOf(b)));
+};
 
 export type BreezyPiledriverLmdbOptions = { path: string, dbId?: string, compression?: boolean };
 export type BreezyPiledriverDatabaseOptions = { disableHeapReadCache?: boolean, garbageCollectionProcessStartedAtMillis?: number };
@@ -70,10 +100,34 @@ export function declareBreezyPiledriverDatabase(
     if (entry === undefined) return { buffer: null, seq: initialSeq };
     return { buffer: arrayBuffer(entry.value), seq: toSeq(entry.version ?? throwErr("Versioned LMDB entry has no transaction ID")) };
   };
-  const loadHeapObject = async (key: ArrayBuffer, keyBase64: string) => {
+  // Node runs one piece of JavaScript at a time. LMDB reads are synchronous (they never wait on IO),
+  // so a read that loads thousands of heap objects would otherwise keep running until it's done,
+  // and every other request would wait behind it. So every 1,000 loads, counted across all reads,
+  // the read that hits the count pauses: it goes to the back of the queue, the requests already
+  // waiting run, then it continues exactly where it stopped. Heap objects never change once saved,
+  // so the pause can't make a read see different data. 1,000 loads take a few milliseconds.
+  const heapLoadsBetweenPauses = 1000;
+  let heapLoadsSinceLastPause = 0;
+  const letWaitingRequestsRun = () => new Promise<void>(resolve => setImmediate(resolve));
+  const readHeapObject = (key: ArrayBuffer, keyBase64: string) => {
     const stored = read(lmdbHeap, key);
     if (stored.buffer === null) throw new Error(`Assertion error: Heap object with base64 key "${keyBase64}" not found`);
-    return decodePiledriverObject(stored.buffer, childKey => heapCache.resolve(childKey, stored.seq));
+    return decodePiledriverObject(stored.buffer, childKey => heapCache.resolve(childKey, stored.seq), `heap object ${keyBase64}`);
+  };
+  // close() waits for these, so a paused load never resumes after LMDB is closed. A load that doesn't
+  // pause runs start to finish without letting anything else run, so close() can't happen during it.
+  const pausedHeapLoads = new Set<Promise<PiledriverObject>>();
+  const loadHeapObject = async (key: ArrayBuffer, keyBase64: string) => {
+    throwIfClosing();
+    if (++heapLoadsSinceLastPause < heapLoadsBetweenPauses) return readHeapObject(key, keyBase64);
+    heapLoadsSinceLastPause = 0;
+    const pausedLoad = letWaitingRequestsRun().then(() => readHeapObject(key, keyBase64));
+    pausedHeapLoads.add(pausedLoad);
+    try {
+      return await pausedLoad;
+    } finally {
+      pausedHeapLoads.delete(pausedLoad);
+    }
   };
   const heapCache = createPiledriverHeapCache({ disabled: options.disableHeapReadCache === true, load: loadHeapObject });
   let lastRootWriteSeq = initialSeq;
@@ -136,14 +190,27 @@ export function declareBreezyPiledriverDatabase(
     return result;
   };
   type ReferenceDelta = { key: ArrayBuffer, count: number };
+  const noHeapKeysCreated: ReadonlySet<string> = new Set();
   const addReferenceDelta = (deltas: Map<string, ReferenceDelta>, key: ArrayBuffer, count: number) => {
     const id = encodeBase64(new Uint8Array(key));
     const existing = deltas.get(id);
     if (existing === undefined) deltas.set(id, { key, count });
     else existing.count += count;
   };
+  /**
+   * Runs `action` as one all-or-nothing LMDB transaction.
+   *
+   * We use `childTransaction` because it is the only async lmdb-js transaction that rolls back when
+   * the callback throws. Plain `transaction()` keeps every write made before the throw, so an error
+   * after a refcount write but before the root write would leave refcounts that disagree with the
+   * root, and GC could later delete live data. `transactionSync()` also rolls back, but it commits on
+   * the main thread and stalled the server for seconds under load.
+   *
+   * lmdb-js disables `childTransaction` when `useWritemap` or caching is on, so Breezy can't enable
+   * either without replacing this rollback guarantee.
+   */
   const transact = async (action: (version: number, writes: Promise<boolean>[]) => void) => {
-    const transaction = await lmdbRoot.transaction(() => {
+    const transaction = await lmdbRoot.childTransaction(() => {
       const version = lmdbRoot.getWriteTxnId();
       const pending: Promise<boolean>[] = [];
       action(version, pending);
@@ -179,17 +246,28 @@ export function declareBreezyPiledriverDatabase(
     dereferencedAtMillis: number | null,
     version: number,
     writes: Promise<boolean>[],
+    heapKeysCreatedByThisWrite: ReadonlySet<string>,
   ) => {
     const createdAtMillis = Math.max(Date.now(), processStartedAtMillis);
     let becameZero = 0;
     const changes: Array<{ key: Buffer, value: Buffer, candidateToAdd: Buffer | null, candidateToRemove: Buffer | null }> = [];
     for (const { key, count } of deltas) {
-      if (count === 0) continue;
+      const isCreatedByThisWrite = heapKeysCreatedByThisWrite.has(encodeBase64(new Uint8Array(key)));
+      // A zero delta changes nothing, except for a new object: it still needs its record.
+      if (count === 0 && !isCreatedByThisWrite) continue;
       const metadataKey = Buffer.from(key);
       const stored = lmdbMetadata.get(metadataKey);
       const previous = stored === undefined ? null : parseMetadata(stored);
-      if (previous === null && count < 0) throw new Error("Piledriver GC cannot decrement an object without reference metadata");
-      if (previous !== null && previous.generation !== activeGcGeneration()) throw new Error("Piledriver GC reference metadata belongs to an inactive generation");
+      // Breezy creates a record in the same transaction that saves a new object, so a missing record
+      // is expected only for objects this write created. Any other object without a record (or with
+      // one from an older GC generation) was saved before refcount GC existed and its true count is
+      // unknown. Like base's "legacy-immortal" rule, skip it so it's never deleted: a count started
+      // here could reach zero while older parents still point at it.
+      const isLegacyObject = previous === null
+        ? !isCreatedByThisWrite
+        : previous.generation !== activeGcGeneration();
+      if (isLegacyObject) continue;
+      if (previous === null && count < 0) throw new Error("Assertion error: Piledriver GC cannot decrement a heap object created by the same write");
       const referenceCount = (previous?.referenceCount ?? 0) + count;
       if (!Number.isSafeInteger(referenceCount) || referenceCount < 0) throw new Error("Piledriver GC reference count would become invalid");
       const lastDereferencedAtMillis = count < 0
@@ -198,15 +276,18 @@ export function declareBreezyPiledriverDatabase(
       const replacement: ReferenceMetadata = previous === null
         ? { schemaVersion: gcSchemaVersion, generation: activeGcGeneration(), referenceCount, createdAtMillis, lastDereferencedAtMillis, deletion: null }
         : { ...previous, referenceCount, lastDereferencedAtMillis };
+      // A new object that starts at zero is one only the root will point at. It becomes a GC
+      // candidate right away, so if the root write fails it's collected like any other garbage.
+      const becomesCandidate = referenceCount === 0 && (previous === null || previous.referenceCount !== 0);
       changes.push({
         key: metadataKey,
         value: Buffer.from(JSON.stringify(replacement)),
-        candidateToAdd: previous !== null && previous.referenceCount !== 0 && referenceCount === 0 ? candidateKey(key, lastDereferencedAtMillis ?? previous.createdAtMillis) : null,
+        candidateToAdd: becomesCandidate ? candidateKey(key, lastDereferencedAtMillis ?? replacement.createdAtMillis) : null,
         candidateToRemove: previous?.referenceCount === 0 && referenceCount !== 0 ? candidateKey(key, previous.lastDereferencedAtMillis ?? previous.createdAtMillis) : null,
       });
       if (previous !== null && previous.referenceCount !== 0 && referenceCount === 0) becameZero++;
     }
-    for (const change of changes) {
+    for (const change of ascendingByKey(changes, change => change.key)) {
       writes.push(lmdbMetadata.put(change.key, change.value, version));
       if (change.candidateToAdd !== null) writes.push(lmdbCandidates.put(change.candidateToAdd, Buffer.alloc(0), version));
       if (change.candidateToRemove !== null) writes.push(lmdbCandidates.remove(change.candidateToRemove));
@@ -216,6 +297,9 @@ export function declareBreezyPiledriverDatabase(
   const publishHeapObjects = async (objects: Array<{ key: ArrayBuffer, buffer: ArrayBuffer, referenceKeys: ArrayBuffer[] }>) => {
     if (objects.length === 0) return initialSeq;
     const deltas = new Map<string, ReferenceDelta>();
+    // Every new object gets its record here, in the same transaction that saves it. A zero delta
+    // creates the record for objects nothing new points at; the root write then adds its reference.
+    for (const object of objects) addReferenceDelta(deltas, object.key, 0);
     for (const object of objects) for (const key of object.referenceKeys) addReferenceDelta(deltas, key, 1);
     const version = await transact((transactionVersion, writes) => {
       const heapKeys = new Set<string>();
@@ -225,8 +309,10 @@ export function declareBreezyPiledriverDatabase(
         heapKeys.add(heapKeyBase64);
         if (lmdbHeap.doesExist(Buffer.from(object.key))) throw new Error("Reserved Piledriver heap key already exists");
       }
-      changeReferenceDeltas(deltas.values(), null, transactionVersion, writes);
-      for (const object of objects) writes.push(lmdbHeap.put(Buffer.from(object.key), Buffer.from(object.buffer), transactionVersion));
+      changeReferenceDeltas(deltas.values(), null, transactionVersion, writes, heapKeys);
+      for (const object of ascendingByKey(objects, object => new Uint8Array(object.key))) {
+        writes.push(lmdbHeap.put(Buffer.from(object.key), Buffer.from(object.buffer), transactionVersion));
+      }
     });
     return toSeq(version);
   };
@@ -235,7 +321,7 @@ export function declareBreezyPiledriverDatabase(
     for (const [id, reference] of aggregateSerializedReferences(next)) deltas.set(id, { ...reference });
     for (const reference of aggregateSerializedReferences(previous).values()) addReferenceDelta(deltas, reference.key, -reference.count);
     const version = await transact((transactionVersion, writes) => {
-      changeReferenceDeltas(deltas.values(), dereferencedAtMillis, transactionVersion, writes);
+      changeReferenceDeltas(deltas.values(), dereferencedAtMillis, transactionVersion, writes, noHeapKeysCreated);
       writes.push(next === null ? lmdbRoots.remove(Buffer.from(key)) : lmdbRoots.put(Buffer.from(key), Buffer.from(next), transactionVersion));
     });
     return { seq: toSeq(version) };
@@ -258,8 +344,8 @@ export function declareBreezyPiledriverDatabase(
    * Plans the complete graph, then publishes every newly created heap object atomically.
    *
    * Planning replaces heap objects with key-only references, so serialization performs no cache
-   * lookups or IO. A crash before the root is published may leak the unreachable subgraph; that
-   * deliberate tradeoff keeps the normal publication path small and fast.
+   * lookups or IO. If the root write then fails, the new objects are already GC candidates, so the
+   * next GC after a restart collects them.
    */
   const serializeAndPublish = async (value: PiledriverObject) => {
     const plan = planHeapObjects(
@@ -295,7 +381,12 @@ export function declareBreezyPiledriverDatabase(
     return read(lmdbRoots, key);
   };
   let garbageCollectionRunning = false;
-  const collectGarbage = async (cutoffTimestampMillis: number, maxObjects = 1000) => {
+  const garbageCollectionsInProgress = new Set<Promise<unknown>>();
+  let closing: Promise<void> | null = null;
+  const throwIfClosing = () => {
+    if (closing !== null) throw new Error("Breezy Piledriver database is closed");
+  };
+  const collectGarbageUntracked = async (cutoffTimestampMillis: number, maxObjects = 1000) => {
     const startedAtMillis = Date.now();
     const startedAt = performance.now();
     const initializationStartedAt = performance.now();
@@ -308,57 +399,79 @@ export function declareBreezyPiledriverDatabase(
 
     const rangeEnd = Buffer.alloc(8);
     rangeEnd.writeBigUInt64BE(BigInt(cutoffTimestampMillis));
-    const nextCandidate = () => {
+    const readCandidates = (limit: number) => {
       lmdbRoot.resetReadTxn();
-      for (const { key } of lmdbCandidates.getRange({ end: rangeEnd, limit: 1 })) return Buffer.from(key);
-      return null;
+      const candidates: Buffer[] = [];
+      for (const { key } of lmdbCandidates.getRange({ end: rangeEnd, limit })) candidates.push(Buffer.from(key));
+      return candidates;
+    };
+
+    /**
+     * Deletes one zero-reference heap object and decrements its children. Must run inside `transact`.
+     * Returns how many child refcounts it updated.
+     */
+    const deleteCandidate = (indexedCandidate: Buffer, version: number, writes: Promise<boolean>[]) => {
+      const heapKeyBuffer = Buffer.from(indexedCandidate.subarray(8));
+      const heapKey = arrayBuffer(heapKeyBuffer);
+      if (!lmdbCandidates.doesExist(indexedCandidate)) {
+        result.objects.candidatesSkipped++;
+        return 0;
+      }
+      const storedMetadata = lmdbMetadata.get(heapKeyBuffer) ?? throwErr("Piledriver GC candidate has no reference metadata");
+      const metadata = parseMetadata(storedMetadata);
+      const eligibleAtMillis = metadata.lastDereferencedAtMillis ?? metadata.createdAtMillis;
+      const expectedCandidate = candidateKey(heapKey, eligibleAtMillis);
+      if (metadata.generation !== activeGcGeneration()) throw new Error("Piledriver GC candidate belongs to an inactive generation");
+      if (metadata.referenceCount !== 0) throw new Error("Piledriver GC candidate still has live references");
+      if (!indexedCandidate.equals(expectedCandidate)) throw new Error("Piledriver GC candidate index is inconsistent with its metadata");
+
+      const heapValue = lmdbHeap.get(heapKeyBuffer) ?? throwErr("Piledriver GC found metadata for a missing heap object");
+      const references = [...aggregateSerializedReferences(arrayBuffer(heapValue)).values()];
+      const deltas = references.map(reference => ({ key: reference.key, count: -reference.count }));
+      result.objects.childObjectsBecameUnreferenced += changeReferenceDeltas(deltas, eligibleAtMillis, version, writes, noHeapKeysCreated);
+      result.references.outgoingEdgesProcessed += references.reduce((sum, reference) => sum + reference.count, 0);
+      writes.push(lmdbHeap.remove(heapKeyBuffer), lmdbMetadata.remove(heapKeyBuffer), lmdbCandidates.remove(indexedCandidate));
+
+      result.objects.deleted++;
+      result.reclaimed.heapPayloadBytes += heapValue.byteLength;
+      result.reclaimed.heapKeyBytes += heapKeyBuffer.byteLength;
+      result.reclaimed.metadataValueBytes += storedMetadata.byteLength;
+      result.reclaimed.metadataKeyBytes += heapKeyBuffer.byteLength;
+      result.reclaimed.candidateKeyBytes += indexedCandidate.byteLength;
+      if (result.samples.deletedObjectKeysBase64.length < result.samples.limitPerCategory) result.samples.deletedObjectKeysBase64.push(encodeBase64(heapKeyBuffer));
+      result.reclaimed.smallestHeapPayloadBytes = Math.min(result.reclaimed.smallestHeapPayloadBytes ?? Infinity, heapValue.byteLength);
+      result.reclaimed.largestHeapPayloadBytes = Math.max(result.reclaimed.largestHeapPayloadBytes ?? 0, heapValue.byteLength);
+      return references.length;
     };
 
     try {
-      let candidate = nextCandidate();
-      while (candidate !== null && result.objects.deleted < maxObjects) {
-        if (candidate.byteLength <= 8) throw new Error("Invalid Piledriver GC candidate key");
-        const indexedCandidate = candidate;
-        const heapKeyBuffer = Buffer.from(candidate.subarray(8));
-        const heapKey = arrayBuffer(heapKeyBuffer);
-        result.objects.candidatesExamined++;
-        result.objects.candidatesQueuedFromIndex = result.objects.candidatesExamined;
-        result.scanning.candidateIndexEntriesRead++;
+      while (result.objects.deleted < maxObjects) {
+        const batch = readCandidates(Math.min(gcDeletionsPerTransaction, maxObjects - result.objects.deleted));
+        if (batch.length === 0) break;
+        for (const candidate of batch) {
+          if (candidate.byteLength <= 8) throw new Error("Invalid Piledriver GC candidate key");
+        }
+        // Counted when read, not when processed: candidates the budget leaves out are read again by
+        // the next batch, and that rereading is real scan work.
+        result.scanning.candidateIndexEntriesRead += batch.length;
 
+        // Two objects in one batch can point at the same child. That's safe because reads inside a
+        // transaction see its own earlier writes, so the second decrement starts from the first's
+        // result. A child that reaches zero becomes a candidate here and is deleted by a later batch.
         await transact((version, writes) => {
-          if (!lmdbCandidates.doesExist(indexedCandidate)) {
-            result.objects.candidatesSkipped++;
-            return;
+          let referenceUpdates = 0;
+          for (const candidate of batch) {
+            // Checked before each object rather than after, so one object over the budget is still
+            // deleted on its own. Candidates left out stay in the index for the next batch.
+            if (referenceUpdates >= gcReferenceUpdatesPerTransaction) break;
+            result.objects.candidatesExamined++;
+            referenceUpdates += deleteCandidate(candidate, version, writes);
           }
-          const storedMetadata = lmdbMetadata.get(heapKeyBuffer) ?? throwErr("Piledriver GC candidate has no reference metadata");
-          const metadata = parseMetadata(storedMetadata);
-          const eligibleAtMillis = metadata.lastDereferencedAtMillis ?? metadata.createdAtMillis;
-          const expectedCandidate = candidateKey(heapKey, eligibleAtMillis);
-          if (metadata.generation !== activeGcGeneration()) throw new Error("Piledriver GC candidate belongs to an inactive generation");
-          if (metadata.referenceCount !== 0) throw new Error("Piledriver GC candidate still has live references");
-          if (!indexedCandidate.equals(expectedCandidate)) throw new Error("Piledriver GC candidate index is inconsistent with its metadata");
-
-          const heapValue = lmdbHeap.get(heapKeyBuffer) ?? throwErr("Piledriver GC found metadata for a missing heap object");
-          const references = [...aggregateSerializedReferences(arrayBuffer(heapValue)).values()];
-          const deltas = references.map(reference => ({ key: reference.key, count: -reference.count }));
-          result.objects.childObjectsBecameUnreferenced += changeReferenceDeltas(deltas, eligibleAtMillis, version, writes);
-          result.references.outgoingEdgesProcessed += references.reduce((sum, reference) => sum + reference.count, 0);
-          writes.push(lmdbHeap.remove(heapKeyBuffer), lmdbMetadata.remove(heapKeyBuffer), lmdbCandidates.remove(indexedCandidate));
-
-          result.objects.deleted++;
-          result.reclaimed.heapPayloadBytes += heapValue.byteLength;
-          result.reclaimed.heapKeyBytes += heapKeyBuffer.byteLength;
-          result.reclaimed.metadataValueBytes += storedMetadata.byteLength;
-          result.reclaimed.metadataKeyBytes += heapKeyBuffer.byteLength;
-          result.reclaimed.candidateKeyBytes += indexedCandidate.byteLength;
-          if (result.samples.deletedObjectKeysBase64.length < result.samples.limitPerCategory) result.samples.deletedObjectKeysBase64.push(encodeBase64(heapKeyBuffer));
-          result.reclaimed.smallestHeapPayloadBytes = Math.min(result.reclaimed.smallestHeapPayloadBytes ?? Infinity, heapValue.byteLength);
-          result.reclaimed.largestHeapPayloadBytes = Math.max(result.reclaimed.largestHeapPayloadBytes ?? 0, heapValue.byteLength);
         });
-        candidate = nextCandidate();
+        result.objects.candidatesQueuedFromIndex = result.objects.candidatesExamined;
       }
 
-      const moreEligibleWorkMayRemain = candidate !== null;
+      const moreEligibleWorkMayRemain = readCandidates(1).length > 0;
       result.limits.limitReached = result.objects.deleted === maxObjects;
       result.limits.moreEligibleWorkMayRemain = moreEligibleWorkMayRemain;
       result.scanning.candidateIndexPagesRead = result.objects.candidatesExamined === 0 ? 0 : 1;
@@ -386,21 +499,47 @@ export function declareBreezyPiledriverDatabase(
     }
   };
 
+  const collectGarbage = async (cutoffTimestampMillis: number, maxObjects?: number) => {
+    throwIfClosing();
+    const collection = collectGarbageUntracked(cutoffTimestampMillis, maxObjects);
+    garbageCollectionsInProgress.add(collection);
+    try {
+      return await collection;
+    } finally {
+      garbageCollectionsInProgress.delete(collection);
+    }
+  };
+  /**
+   * Waits for writes, garbage collections and heap reads already in progress, then closes LMDB.
+   * Closing LMDB under them made them fail midway. New operations started after this is called
+   * throw, so nothing new can start while this waits.
+   */
+  const close = async () => {
+    closing ??= withMutationLock(async () => {
+      // Each operation's own caller gets its result or error; here we only wait for it to stop.
+      await Promise.allSettled([...garbageCollectionsInProgress, ...pausedHeapLoads]);
+      await lmdbRoot.close();
+    });
+    await closing;
+  };
+
   return {
     getDebugInfo: () => ({ backend: "piledriver-breezy", constructorArguments: { lmdbOptions, options }, lmdbRoot, lmdbRoots, lmdbHeap, lmdbMetadata, lmdbCandidates, lmdbGcState, processStartedAtMillis, heapObjectsByObject, heapObjectsByHeapKeyBase64: heapCache.objectsByKey, heapKeysAndSeqByHeapObjects: heapCache.locations, heapReadCacheDisabled: options.disableHeapReadCache === true }),
     async getRootObject(key) {
+      throwIfClosing();
       const stored = read(lmdbRoots, key);
       if (stored.buffer === null) throw new Error("Root object not found");
-      return { object: decodePiledriverObject(stored.buffer, heapKey => heapCache.resolve(heapKey, stored.seq)), seq: stored.seq };
+      return { object: decodePiledriverObject(stored.buffer, heapKey => heapCache.resolve(heapKey, stored.seq), `root ${encodeBase64(new Uint8Array(key))}`), seq: stored.seq };
     },
     async setRootObject(key, value) {
+      throwIfClosing();
       return await withMutationLock(async () => {
         await initializeGc();
         const previous = await readPreviousRoot(key);
-        const serialized = await serializeAndPublish(value);
+        const serializedRoot = await serializeAndPublish(value);
         const written = await mutateRoot(
           key,
-          serialized,
+          serializedRoot,
           previous.buffer,
           Math.max(Date.now(), processStartedAtMillis),
         );
@@ -409,6 +548,7 @@ export function declareBreezyPiledriverDatabase(
       });
     },
     async deleteRootObject(key) {
+      throwIfClosing();
       return await withMutationLock(async () => {
         await initializeGc();
         const previous = await readPreviousRoot(key);
@@ -425,7 +565,7 @@ export function declareBreezyPiledriverDatabase(
     getGarbageCollectionProcessStartedAtMillis: () => processStartedAtMillis,
     collectGarbage,
     combineSeqs: (...seqs) => combineSeqs(seqs),
-    close: async () => await lmdbRoot.close(),
+    close,
     waitUntilAvailable,
     async waitUntilDurable(seq) {
       await waitUntilAvailable(seq);
