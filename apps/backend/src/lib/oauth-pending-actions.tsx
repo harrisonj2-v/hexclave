@@ -1,13 +1,12 @@
 import { usersCrudHandlers } from "@/app/api/latest/users/crud";
 import { logSignInAttemptInBackground } from "@/lib/compliance-events";
-import { createOAuthUserAndAccount, createProjectUserOAuthAccountForLink, findExistingOAuthAccount, storeOAuthProviderTokens } from "@/lib/oauth";
-import { buildSignUpRuleOptions, deserializeStoredSignUpRequestContext, reconstructTurnstileAssessment, storedSignUpRequestContextSchemaFields } from "@/lib/sign-up-context";
+import { createOAuthUserAndAccountWithEvaluatedSignUp, createProjectUserOAuthAccountForLink, findExistingOAuthAccount, storeOAuthProviderTokens } from "@/lib/oauth";
 import { Tenancy } from "@/lib/tenancies";
+import { evaluatedSignUpSchema } from "@/lib/users";
 import { getPrismaClientForTenancy } from "@/prisma-client";
 import { KnownErrors } from "@hexclave/shared";
 import { yupArray, yupBoolean, yupNumber, yupObject, yupString, yupUnion } from "@hexclave/shared/dist/schema-fields";
 import { HexclaveAssertionError, StatusError } from "@hexclave/shared/dist/utils/errors";
-import { turnstileResultValues } from "@hexclave/shared/dist/utils/turnstile";
 import * as yup from "yup";
 
 /**
@@ -52,12 +51,10 @@ const upgradeAnonymousUserActionSchema = yupObject({
   primaryEmailAuthEnabled: yupBoolean().defined(),
   displayName: yupString().nullable().defined(),
   profileImageUrl: yupString().nullable().defined(),
-  oauthAccountCreatedAtMillis: yupNumber().nullable().defined(),
-  turnstileResult: yupString().oneOf(turnstileResultValues).defined(),
-  turnstileVisibleChallengeResult: yupString().oneOf(turnstileResultValues).nullable().defined(),
-  // Sign-up rules are evaluated when the action is applied, but against the request context of the /callback
-  // request (the browser that went through the provider), to match the non-deferred sign-up paths.
-  signUpRequestContext: yupObject(storedSignUpRequestContextSchemaFields).defined(),
+  // The sign-up checks (incl. sign-up rules) already ran in /callback, so that a rejection takes the callback's error
+  // redirect like on every other OAuth sign-up. SDKs can't surface errors from the code exchange properly; they turn
+  // them into a generic error. Only the user creation is deferred.
+  evaluatedSignUp: evaluatedSignUpSchema,
   providerTokens: providerTokensSchema,
 }).defined();
 
@@ -119,7 +116,7 @@ export async function applyPendingOAuthAction(options: {
         // match the user ID the authorization code (and thus the issued tokens) were bound to.
         throw new StatusError(409, "The anonymous user was upgraded by another request during the OAuth flow. Please try signing in again.");
       }
-      const result = await createOAuthUserAndAccount(prisma, tenancy, {
+      const result = await createOAuthUserAndAccountWithEvaluatedSignUp(prisma, tenancy, {
         providerId: action.providerId,
         providerAccountId: action.providerAccountId,
         email: action.email,
@@ -128,13 +125,7 @@ export async function applyPendingOAuthAction(options: {
         currentUser,
         displayName: action.displayName,
         profileImageUrl: action.profileImageUrl,
-        signUpRuleOptions: buildSignUpRuleOptions({
-          authMethod: "oauth",
-          oauthProvider: action.providerId,
-          oauthAccountCreatedAtMillis: action.oauthAccountCreatedAtMillis,
-          requestContext: deserializeStoredSignUpRequestContext(action.signUpRequestContext),
-          turnstileAssessment: reconstructTurnstileAssessment(action.turnstileResult, action.turnstileVisibleChallengeResult ?? undefined),
-        }),
+        evaluatedSignUp: action.evaluatedSignUp,
       });
       if (result.projectUserId !== projectUserId) {
         throw new HexclaveAssertionError("Upgrading an anonymous user via OAuth produced a different user ID", { expected: projectUserId, actual: result.projectUserId });

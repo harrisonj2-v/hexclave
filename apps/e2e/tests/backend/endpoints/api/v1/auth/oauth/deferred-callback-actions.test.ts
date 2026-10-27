@@ -1,7 +1,8 @@
 import { throwErr } from "@hexclave/shared/dist/utils/errors";
+import { urlString } from "@hexclave/shared/dist/utils/urls";
 import { expect } from "vitest";
 import { it, localRedirectUrl } from "../../../../../../helpers";
-import { Auth, backendContext, niceBackendFetch } from "../../../../../backend-helpers";
+import { Auth, Project, backendContext, niceBackendFetch } from "../../../../../backend-helpers";
 
 // The OAuth provider leg (/authorize -> provider -> /callback) isn't bound to a browser, so whoever completes it
 // at the provider may not be whoever started it with their `token`. Linking a provider account to the token's
@@ -100,6 +101,72 @@ it("anonymous upgrade via OAuth is not applied until the authorization code is r
   expect(me.is_anonymous).toBe(false);
   expect(me.primary_email).toBe(backendContext.value.mailbox.emailAddress);
   expect(me.oauth_providers).toEqual([expect.objectContaining({ id: "spotify" })]);
+});
+
+it("anonymous upgrade via OAuth is rejected by sign-up rules in /callback (with the error redirect), not on redeem", async ({ expect }) => {
+  await Project.createAndSwitch({
+    config: {
+      oauth_providers: [{ id: "spotify", type: "shared" }],
+    },
+  });
+  await Project.updateConfig({
+    "auth.signUpRules.block-oauth": {
+      enabled: true,
+      displayName: "Block OAuth signups",
+      priority: 0,
+      condition: 'authMethod == "oauth"',
+      action: {
+        type: "reject",
+        message: "OAuth signups are not allowed",
+      },
+    },
+    "auth.signUpRulesDefaultAction": "allow",
+  });
+  const { accessToken: anonAccessToken } = await Auth.Anonymous.signUp();
+
+  // SDKs can't surface errors from the code exchange properly, so the rejection must be the callback's error
+  // redirect, like for a non-anonymous OAuth sign-up
+  const { response } = await Auth.OAuth.getMaybeFailingAuthorizationCode();
+  expect(response.status).toBe(307);
+  const location = new URL(response.headers.get("location") ?? throwErr("Expected the OAuth callback to redirect"));
+  expect(location.searchParams.get("errorCode")).toBe("SIGN_UP_REJECTED");
+  expect(location.searchParams.get("code")).toBeNull();
+
+  const me = await getMe(anonAccessToken);
+  expect(me.is_anonymous).toBe(true);
+  expect(me.oauth_providers).toEqual([]);
+});
+
+it("anonymous upgrade via OAuth applies the restriction of a sign-up rule evaluated in /callback on redeem", async ({ expect }) => {
+  await Project.createAndSwitch({
+    config: {
+      oauth_providers: [{ id: "spotify", type: "shared" }],
+    },
+  });
+  await Project.updateConfig({
+    "auth.signUpRules.restrict-oauth": {
+      enabled: true,
+      displayName: "Restrict OAuth signups",
+      priority: 0,
+      condition: 'authMethod == "oauth"',
+      action: {
+        type: "restrict",
+      },
+    },
+    "auth.signUpRulesDefaultAction": "allow",
+  });
+  const { userId: anonUserId } = await Auth.Anonymous.signUp();
+
+  const { authorizationCode } = await Auth.OAuth.getAuthorizationCode();
+  const tokenResponse = await redeemAuthorizationCode(authorizationCode, Auth.OAuth.testCodeVerifier);
+  expect(tokenResponse.status).toBe(200);
+
+  const userResponse = await niceBackendFetch(urlString`/api/v1/users/${anonUserId}`, { accessType: "admin" });
+  expect(userResponse.status).toBe(200);
+  expect(userResponse.body.is_anonymous).toBe(false);
+  expect(userResponse.body.restricted_by_admin).toBe(true);
+  expect(userResponse.body.restricted_by_admin_private_details).toContain("restrict-oauth");
+  expect(userResponse.body.oauth_providers).toEqual([expect.objectContaining({ id: "spotify" })]);
 });
 
 it("anonymous upgrade via OAuth fails on redeem if the anonymous user was upgraded in the meantime", async ({ expect }) => {

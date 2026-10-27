@@ -1,9 +1,9 @@
 import { usersCrudHandlers } from "@/app/api/latest/users/crud";
 import { logSignInAttemptInBackground } from "@/lib/compliance-events";
 import { getBestEffortEndUserRequestContext } from "@/lib/end-users";
-import { buildSignUpRuleOptions, reconstructTurnstileAssessment, serializeStoredSignUpRequestContext } from "@/lib/sign-up-context";
+import { buildSignUpRuleOptions, reconstructTurnstileAssessment } from "@/lib/sign-up-context";
 import { checkApiKeySet, throwCheckApiKeySetError } from "@/lib/internal-api-keys";
-import { createOAuthUserAndAccount, findExistingOAuthAccount, handleOAuthEmailMergeStrategy, linkOAuthAccountToUser, storeOAuthProviderTokens } from "@/lib/oauth";
+import { createOAuthUserAndAccount, evaluateOAuthSignUp, findExistingOAuthAccount, handleOAuthEmailMergeStrategy, linkOAuthAccountToUser, storeOAuthProviderTokens } from "@/lib/oauth";
 import { PendingOAuthAction, PendingOAuthProviderTokens } from "@/lib/oauth-pending-actions";
 import { isAcceptedNativeAppUrl, validateRedirectUrl } from "@/lib/redirect-urls";
 import { getApiUrlForRequest } from "@/lib/request-api-url";
@@ -440,15 +440,28 @@ const handler = createSmartRouteHandler({
                   }
 
                   const requestContext = await getBestEffortEndUserRequestContext();
+                  const signUpRuleOptions = buildSignUpRuleOptions({
+                    authMethod: 'oauth',
+                    oauthProvider: provider.id,
+                    oauthAccountCreatedAtMillis: userInfo.accountCreatedAtMillis,
+                    requestContext,
+                    turnstileAssessment: reconstructTurnstileAssessment(
+                      outerInfo.turnstileResult ?? "invalid",
+                      outerInfo.turnstileVisibleChallengeResult,
+                    ),
+                  });
 
                   if (currentUser?.is_anonymous) {
                     // ========================== upgrade anonymous user (deferred) ==========================
                     // The anonymous user was chosen by the flow's initiator, so the upgrade is deferred to the
-                    // PKCE-protected code exchange; see PendingOAuthAction. Sign-up being disabled is checked
-                    // here too so the user gets the error redirect early.
-                    if (!tenancy.config.auth.allowSignUp) {
-                      throw new KnownErrors.SignUpNotEnabled();
-                    }
+                    // PKCE-protected code exchange; see PendingOAuthAction. The sign-up checks run here though,
+                    // so that rejections get the error redirect below instead of failing the code exchange.
+                    const evaluatedSignUp = await evaluateOAuthSignUp(tenancy, {
+                      email: userInfo.email ?? null,
+                      emailVerified: userInfo.emailVerified,
+                      currentUser,
+                      signUpRuleOptions,
+                    });
                     return {
                       id: currentUser.id,
                       newUser: true,
@@ -464,10 +477,7 @@ const handler = createSmartRouteHandler({
                         primaryEmailAuthEnabled,
                         displayName: userInfo.displayName ?? null,
                         profileImageUrl: userInfo.profileImageUrl ?? null,
-                        oauthAccountCreatedAtMillis: userInfo.accountCreatedAtMillis,
-                        turnstileResult: outerInfo.turnstileResult ?? "invalid",
-                        turnstileVisibleChallengeResult: outerInfo.turnstileVisibleChallengeResult ?? null,
-                        signUpRequestContext: serializeStoredSignUpRequestContext(requestContext),
+                        evaluatedSignUp,
                         providerTokens,
                       } satisfies PendingOAuthAction,
                     };
@@ -485,16 +495,7 @@ const handler = createSmartRouteHandler({
                       currentUser,
                       displayName: userInfo.displayName ?? null,
                       profileImageUrl: userInfo.profileImageUrl ?? null,
-                      signUpRuleOptions: buildSignUpRuleOptions({
-                        authMethod: 'oauth',
-                        oauthProvider: provider.id,
-                        oauthAccountCreatedAtMillis: userInfo.accountCreatedAtMillis,
-                        requestContext,
-                        turnstileAssessment: reconstructTurnstileAssessment(
-                          outerInfo.turnstileResult ?? "invalid",
-                          outerInfo.turnstileVisibleChallengeResult,
-                        ),
-                      }),
+                      signUpRuleOptions,
                     }
                   );
 

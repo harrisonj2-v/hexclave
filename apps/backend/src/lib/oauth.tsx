@@ -1,6 +1,6 @@
 import { getAuthContactChannelWithEmailNormalization } from "@/lib/contact-channel";
 import { Tenancy } from "@/lib/tenancies";
-import { createOrUpgradeAnonymousUserWithRules, SignUpRuleOptions } from "@/lib/users";
+import { createOrUpgradeAnonymousUserWithEvaluatedSignUp, EvaluatedSignUp, evaluateSignUp, SignUpRuleOptions } from "@/lib/users";
 import { PrismaClientTransaction } from "@/prisma-client";
 import { UsersCrud } from "@hexclave/shared/dist/interface/crud/users";
 import { KnownErrors } from "@hexclave/shared/dist/known-errors";
@@ -241,7 +241,7 @@ export async function storeOAuthProviderTokens(prisma: PrismaClientTransaction, 
  * This is used when a new OAuth sign-up should create a new user account.
  *
  * Creates:
- * - User record (via createOrUpgradeAnonymousUserWithRules)
+ * - User record (via evaluateSignUp and createOrUpgradeAnonymousUserWithEvaluatedSignUp)
  * - Auth method record
  * - OAuth account record with nested oauthAuthMethod
  *
@@ -251,25 +251,59 @@ export async function storeOAuthProviderTokens(prisma: PrismaClientTransaction, 
 export async function createOAuthUserAndAccount(
   prisma: PrismaClientTransaction,
   tenancy: Tenancy,
-  params: {
-    providerId: string,
-    providerAccountId: string,
-    email: string | null,
-    emailVerified: boolean,
-    primaryEmailAuthEnabled: boolean,
-    currentUser: UsersCrud["Admin"]["Read"] | null,
-    displayName: string | null,
-    profileImageUrl: string | null,
+  params: OAuthSignUpParams & {
     signUpRuleOptions: SignUpRuleOptions,
   }
 ): Promise<{ projectUserId: string, oauthAccountId: string }> {
-  // Check if sign up is allowed
+  const evaluatedSignUp = await evaluateOAuthSignUp(tenancy, params);
+  return await createOAuthUserAndAccountWithEvaluatedSignUp(prisma, tenancy, { ...params, evaluatedSignUp });
+}
+
+type OAuthSignUpParams = {
+  providerId: string,
+  providerAccountId: string,
+  email: string | null,
+  emailVerified: boolean,
+  primaryEmailAuthEnabled: boolean,
+  currentUser: UsersCrud["Admin"]["Read"] | null,
+  displayName: string | null,
+  profileImageUrl: string | null,
+};
+
+/**
+ * Runs the checks of `createOAuthUserAndAccount` (sign-up enabled, bot challenge, sign-up rules) without creating
+ * anything. Pass the result to `createOAuthUserAndAccountWithEvaluatedSignUp`.
+ */
+export async function evaluateOAuthSignUp(
+  tenancy: Tenancy,
+  params: Pick<OAuthSignUpParams, "email" | "emailVerified" | "currentUser"> & {
+    signUpRuleOptions: SignUpRuleOptions,
+  },
+): Promise<EvaluatedSignUp> {
+  if (!tenancy.config.auth.allowSignUp) {
+    throw new KnownErrors.SignUpNotEnabled();
+  }
+  return await evaluateSignUp(
+    tenancy,
+    params.currentUser,
+    { primary_email: params.email, primary_email_verified: params.emailVerified },
+    params.signUpRuleOptions,
+  );
+}
+
+export async function createOAuthUserAndAccountWithEvaluatedSignUp(
+  prisma: PrismaClientTransaction,
+  tenancy: Tenancy,
+  params: OAuthSignUpParams & {
+    evaluatedSignUp: EvaluatedSignUp,
+  }
+): Promise<{ projectUserId: string, oauthAccountId: string }> {
+  // Re-checked because the sign-up may have been evaluated in an earlier request (see PendingOAuthAction)
   if (!tenancy.config.auth.allowSignUp) {
     throw new KnownErrors.SignUpNotEnabled();
   }
 
-  // Create new user (or upgrade anonymous user) with sign-up rule evaluation
-  const newUser = await createOrUpgradeAnonymousUserWithRules(
+  const newUser = await createOrUpgradeAnonymousUserWithEvaluatedSignUp(
     tenancy,
     params.currentUser,
     {
@@ -280,7 +314,7 @@ export async function createOAuthUserAndAccount(
       primary_email_auth_enabled: params.primaryEmailAuthEnabled,
     },
     [],
-    params.signUpRuleOptions,
+    params.evaluatedSignUp,
   );
 
   // Create auth method
